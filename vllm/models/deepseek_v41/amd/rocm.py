@@ -711,6 +711,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         self._prefill_topk_ragged_cache: dict[
             str, tuple[torch.Tensor, torch.Tensor]
         ] = {}
+        self._prefill_dequant_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._index_source_prefix: str | None = None
         if self.compress_ratio > 0:
             assert self.index_source_layer_id is not None
@@ -1427,18 +1428,32 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             if not swa_only:
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None
-                block_table = attn_metadata.block_table[num_decodes:]
-                # compressed_k_cache is OCP on every platform (Triton encoder).
-                dequantize_and_gather_k_cache(
-                    kv[:chunk_size],
-                    compressed_k_cache,
-                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
-                    gather_lens=None,
-                    block_table=block_table[chunk_start:chunk_end],
-                    block_size=attn_metadata.block_size // self.compress_ratio,
-                    offset=0,
-                    use_fnuz=False,
-                )
+                assert self.compressed_cache_prefix is not None
+                source = self._static_forward_context[self.compressed_cache_prefix]
+                if source is self and chunk_start == chunk_plan[0][0]:
+                    # This layer owns the cache and runs first in its group.
+                    source._prefill_dequant_cache = {}
+                cached = source._prefill_dequant_cache.get((chunk_start, chunk_end))
+                if cached is not None:
+                    kv[:chunk_size, :chunk_N].copy_(cached)
+                else:
+                    block_table = attn_metadata.block_table[num_decodes:]
+                    dequantize_and_gather_k_cache(
+                        kv[:chunk_size],
+                        compressed_k_cache,
+                        seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                        gather_lens=None,
+                        block_table=block_table[chunk_start:chunk_end],
+                        block_size=attn_metadata.block_size // self.compress_ratio,
+                        offset=0,
+                        use_fnuz=False,
+                    )
+                    if source is self:
+                        # Workspace memory is aliased by the next layer, so the
+                        # rows have to be kept off to the side.
+                        source._prefill_dequant_cache[(chunk_start, chunk_end)] = (
+                            kv[:chunk_size, :chunk_N].clone()
+                        )
 
             swa_block_table = swa_metadata.block_table[num_decodes:]
             dequantize_and_gather_k_cache(

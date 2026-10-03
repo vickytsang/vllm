@@ -347,42 +347,44 @@ def _dequantize_and_gather_k_kernel(
     use_fnuz: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
-    worker_id = tl.program_id(1)
-    num_workers = tl.num_programs(1)
-
+    page_id = tl.program_id(1)
     seq_len = tl.load(seq_lens_ptr + batch_idx)
     if gather_lens_ptr is not None:  # noqa: SIM108
         gather_len = tl.load(gather_lens_ptr + batch_idx)
     else:
-        # Gather all tokens
         gather_len = seq_len
     start_pos = seq_len - gather_len
+    token_begin = page_id * cache_block_size
+    if token_begin < gather_len:
+        token_end = tl.minimum(token_begin + cache_block_size, gather_len)
+        for i in tl.range(token_begin, token_end):
+            pos = start_pos + i
 
-    for i in range(worker_id, gather_len, num_workers):
-        # Calculate the actual token index in the sequence
-        pos = start_pos + i
-
-        # Calculate which block and position within block
-        block_in_seq = pos // cache_block_size
-        pos_in_block = pos % cache_block_size
-
-        # Get physical block index from block table
+        pos_begin = start_pos + token_begin
+        pos_end = start_pos + token_end
+        first_page = pos_begin // cache_block_size
+        last_page = (pos_end - 1) // cache_block_size
         block_table_row_ptr = block_table_ptr + batch_idx * max_blocks_per_seq
-        physical_block_idx = tl.load(block_table_row_ptr + block_in_seq)  # int32
 
-        # int64: physical_block_idx * block_stride can exceed 2^31 with many
-        # KV-cache blocks (e.g. >= 57K at block_stride ~37K).
-        cache_block_ptr = k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
+        for page in tl.range(first_page, last_page + 1):
+            physical_block_idx = tl.load(block_table_row_ptr + page)
+            cache_block_ptr = k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
+            page_pos = page * cache_block_size
+            lo = tl.maximum(page_pos, pos_begin)
+            hi = tl.minimum(page_pos + cache_block_size, pos_end)
 
-        # Token data pointer
-        token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
-
-        # Scale pointer: after all token data
-        token_scale_ptr = (
-            cache_block_ptr
-            + cache_block_size * token_data_size
-            + pos_in_block * scale_dim
-        )
+            for pos in tl.range(lo, hi):
+                pos_in_block = pos - page_pos
+                i = pos - start_pos
+                token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+                token_scale_ptr = (
+                    cache_block_ptr
+                    + cache_block_size * token_data_size
+                    + pos_in_block * scale_dim
+                )
+                token_fp8_ptr = token_data_ptr
+                token_bf16_ptr = token_data_ptr + fp8_dim
+                output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
 
         # Token data layout: [0:448] fp8, [448:576] bf16
         token_fp8_ptr = token_data_ptr
@@ -392,36 +394,30 @@ def _dequantize_and_gather_k_kernel(
         output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
 
         # ========== Dequantize FP8 portion using UE8M0 ==========
-        for qblock_idx in tl.static_range(n_quant_blocks):
-            qblock_start = qblock_idx * quant_block
-
-            if qblock_start < fp8_dim:
-                offsets = qblock_start + tl.arange(0, quant_block)
-                mask = offsets < fp8_dim
-
-                # Load quantized fp8 values (stored as uint8)
-                x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
-
-                # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
-                if use_fnuz:
-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-                else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
-
-                # Load and decode UE8M0 scale
-                # UE8M0: scale = 2^(stored_value - 127)
-                encoded_scale = tl.load(token_scale_ptr + qblock_idx)
-                exponent = encoded_scale.to(tl.float32) - 127.0
-                scale = tl.exp2(exponent)
-
-                # Dequantize: bf16_value = fp8_value * scale
-                x_dequant = x_float * scale
-
-                # Store as bf16
-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+        #448 is 3x128 plus a 64-wide tail, and each UE8M0 scale still covers 64 elements, so each 128-wide load uses two scales:
+        vec = tl.arange(0, 128)
+        for vec_idx in tl.static_range(3):
+            offsets = vec_idx * 128 + vec
+            x_uint8 = tl.load(token_fp8_ptr + offsets)
+            if use_fnuz:
+                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+            else:
+                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            s0 = tl.load(token_scale_ptr + vec_idx * 2).to(tl.float32) - 127.0
+            s1 = tl.load(token_scale_ptr + vec_idx * 2 + 1).to(tl.float32) - 127.0
+            scale = tl.where(vec < 64, tl.exp2(s0), tl.exp2(s1))
+            tl.store(
+                output_row_ptr + offsets,
+                (x_fp8.to(tl.float32) * scale).to(tl.bfloat16),
+            )
+        tail = 384 + tl.arange(0, 64)
+        x_uint8 = tl.load(token_fp8_ptr + tail)
+        if use_fnuz:
+            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+        else:
+            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+        scale = tl.exp2(tl.load(token_scale_ptr + 6).to(tl.float32) - 127.0)
+        tl.store(output_row_ptr + tail, (x_fp8.to(tl.float32) * scale).to(tl.bfloat16))
 
         # ========== Copy BF16 portion directly ==========
         bf16_output_offset = fp8_dim  # After 448 elements in output
@@ -654,6 +650,8 @@ def dequantize_and_gather_k_cache_triton(
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
         use_fnuz=use_fnuz,
+        num_warps=4,
+        waves_per_eu=4,
     )
 
 
